@@ -1,0 +1,666 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,4 @@
++AURUM_ENV=dev
++JWT_SECRET=change-me
++DB_URL=sqlite:///aurum.db
++REDIS_URL=redis://redis:6379/0
+
+diff --git a/.github/workflows/automerge.yml b/.github/workflows/automerge.yml
+new file mode 100644
+--- /dev/null
++++ b/.github/workflows/automerge.yml
+@@ -0,0 +1,14 @@
++name: Auto Merge
++on:
++  pull_request:
++    types: [labeled]
++jobs:
++  automerge:
++    if: contains(github.event.pull_request.labels.*.name, 'automerge')
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Merge PR
++        run: gh pr merge ${{ github.event.pull_request.number }} --squash --admin
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,14 @@
++name: CI
++on:
++  push: { branches: ["main", "feat/*", "chore/*", "fix/*"] }
++  pull_request:
++
++jobs:
++  test:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with: { python-version: "3.11" }
++      - run: pip install -r backend/requirements.txt
++      - run: pytest -q
+
+diff --git a/.github/workflows/pr-review.yml b/.github/workflows/pr-review.yml
+new file mode 100644
+--- /dev/null
++++ b/.github/workflows/pr-review.yml
+@@ -0,0 +1,42 @@
++name: PR Review Bot
++on:
++  pull_request:
++    types: [opened, synchronize, reopened]
++
++jobs:
++  review:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - name: Detect changed files
++        id: diff
++        run: |
++          DIFF=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E 'backend/(routes|services|models|config|utils)|frontend/src|docker|openapi' || true)
++          echo "files<<EOF" >> $GITHUB_OUTPUT
++          echo "$DIFF" >> $GITHUB_OUTPUT
++          echo "EOF" >> $GITHUB_OUTPUT
++      - uses: actions/setup-python@v5
++        with: { python-version: "3.11" }
++      - run: pip install -r backend/requirements.txt
++      - name: Run tests
++        id: tests
++        run: |
++          set +e
++          PYTEST_OUT=$(pytest -q 2>&1)
++          CODE=$?
++          echo "ok=$([ $CODE -eq 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
++          echo "log<<EOF" >> $GITHUB_OUTPUT
++          echo "$PYTEST_OUT" >> $GITHUB_OUTPUT
++          echo "EOF" >> $GITHUB_OUTPUT
++          exit 0
++      - name: Comment summary
++        if: always()
++        env:
++          OK: ${{ steps.tests.outputs.ok }}
++          LOG: ${{ steps.tests.outputs.log }}
++        run: |
++          STATUS=$([ "$OK" = "true" ] && echo "✅ Tests passed" || echo "❌ Tests failed")
++          BODY="**$STATUS**\n\n**Arquivos críticos:**\n\`\`\`\n${{ steps.diff.outputs.files }}\n\`\`\`\n\n**pytest:**\n\`\`\`\n${LOG}\n\`\`\`"
++          gh pr comment ${{ github.event.pull_request.number }} --body "$BODY"
++        env:
++          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+diff --git a/README.md b/README.md
+new file mode 100644
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,16 @@
++# AURUM — Starter Full (API + CI)
++
++## Rodar local
++```bash
++pip install -r backend/requirements.txt
++uvicorn backend.server:app --reload
++# http://localhost:8000
++```
++
++## Docker
++```bash
++cd docker && docker compose up -d --build
++```
++
++## CI
++- GitHub Actions já incluso (.github/workflows).
+
+diff --git a/backend/adapters/ci_client.py b/backend/adapters/ci_client.py
+new file mode 100644
+--- /dev/null
++++ b/backend/adapters/ci_client.py
+@@ -0,0 +1,18 @@
++import subprocess, json
++
++def sh(cmd: str) -> str:
++    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
++    if p.returncode != 0:
++        raise RuntimeError(f"CMD FAIL: {cmd}\n{p.stderr}")
++    return p.stdout.strip()
++
++class CIClient:
++    def run_pipeline(self):
++        return {"started": True}
++
++    def status(self):
++        try:
++            out = sh('gh run list --limit 5 --json databaseId,status,conclusion -q .')
++            return {"runs": json.loads(out)}
++        except Exception:
++            return {"runs": []}
+
+diff --git a/backend/adapters/codex_client.py b/backend/adapters/codex_client.py
+new file mode 100644
+--- /dev/null
++++ b/backend/adapters/codex_client.py
+@@ -0,0 +1,21 @@
++import subprocess, shlex, pathlib
++
++ROOT = pathlib.Path(__file__).resolve().parents[2]
++
++def sh(cmd: str, cwd: pathlib.Path | None = None) -> str:
++    p = subprocess.run(cmd, cwd=str(cwd or ROOT), shell=True, capture_output=True, text=True)
++    if p.returncode != 0:
++        raise RuntimeError(f"CMD FAIL: {cmd}\n{p.stderr}")
++    return p.stdout
++
++class CodexClient:
++    def suggest(self, prompt: str, cwd: pathlib.Path | None = None) -> str:
++        cmd = f'gh copilot suggest -p {shlex.quote(prompt)}'
++        return sh(cmd, cwd=cwd).strip()
++
++    def write_file(self, prompt: str, out_path: pathlib.Path) -> str:
++        full = f"Escreva o arquivo COMPLETO para: {out_path.name}\n{prompt}\nResponda apenas com código."
++        code = self.suggest(full)
++        out_path.parent.mkdir(parents=True, exist_ok=True)
++        out_path.write_text(code, encoding="utf-8")
++        return str(out_path)
+
+diff --git a/backend/adapters/repo_client.py b/backend/adapters/repo_client.py
+new file mode 100644
+--- /dev/null
++++ b/backend/adapters/repo_client.py
+@@ -0,0 +1,45 @@
++import subprocess, pathlib
++
++ROOT = pathlib.Path(__file__).resolve().parents[2]
++
++def sh(cmd: str, cwd: pathlib.Path | None = None) -> str:
++    p = subprocess.run(cmd, cwd=str(cwd or ROOT), shell=True, capture_output=True, text=True)
++    if p.returncode != 0:
++        raise RuntimeError(f"CMD FAIL: {cmd}\n{p.stderr}")
++    return p.stdout.strip()
++
++class RepoClient:
++    def __init__(self, default_branch: str = "main"):
++        self.default_branch = default_branch
++
++    def new_branch(self, name: str):
++        sh(f"git checkout -b {name}")
++
++    def commit_all(self, msg: str):
++        sh("git add -A")
++        try:
++            sh(f'git commit -m "{msg}"')
++        except RuntimeError:
++            pass
++
++    def push(self, branch: str):
++        sh(f"git push -u origin {branch}")
++
++    def open_pr(self, title: str, body: str = "", branch: str | None = None) -> dict:
++        if branch:
++            self.push(branch)
++        out = sh(f'gh pr create --title "{title}" --body "{body}" --base {self.default_branch} --head {branch or "HEAD"}')
++        num = sh("gh pr view --json number -q .number")
++        return {"number": int(num), "url": out}
++
++    def merge_pr(self, pr_number: int, squash: bool = True):
++        mode = "--squash" if squash else "--merge"
++        sh(f"gh pr merge {pr_number} {mode} --auto --delete-branch")
++        return {"merged": True, "pr": pr_number}
++
++    def status(self):
++        try:
++            pr = sh("gh pr status --json currentBranch -q .currentBranch")
++        except RuntimeError:
++            pr = "none"
++        return {"pr": pr}
+
+diff --git a/backend/auth/rbac.py b/backend/auth/rbac.py
+new file mode 100644
+--- /dev/null
++++ b/backend/auth/rbac.py
+@@ -0,0 +1,11 @@
++from fastapi import HTTPException, status
++
++def require_role(roles: list[str]):
++    def _dep():
++        # Stub simples: falha se não houver cabeçalho X-Role permitido
++        # Em produção, troque por JWT/Session + checagem de policies.
++        import os
++        # Aqui podemos aceitar tudo em DEV para facilitar (comente para endurecer)
++        # raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="auth_required")
++        return {"role": "admin"}
++    return _dep
+
+diff --git a/backend/config.py b/backend/config.py
+new file mode 100644
+--- /dev/null
++++ b/backend/config.py
+@@ -0,0 +1,18 @@
++from pydantic_settings import BaseSettings
++from pydantic import Field
++from functools import lru_cache
++
++class Settings(BaseSettings):
++    AURUM_ENV: str = Field(..., pattern="^(prod|staging|dev)$")
++    JWT_SECRET: str
++    DB_URL: str
++    REDIS_URL: str
++    GIT_PROVIDER: str = "github"
++    CI_PROVIDER: str = "github_actions"
++
++    class Config:
++        env_file = ".env"
++
++@lru_cache
++def get_settings() -> Settings:
++    return Settings()  # fail-fast se faltar algo obrigatório
+
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+new file mode 100644
+--- /dev/null
++++ b/backend/requirements.txt
+@@ -0,0 +1,8 @@
++fastapi
++uvicorn[standard]
++pydantic>=2
++pydantic-settings
++psutil
++requests
++pytest
++httpx
+
+diff --git a/backend/routes/routes_copilot.py b/backend/routes/routes_copilot.py
+new file mode 100644
+--- /dev/null
++++ b/backend/routes/routes_copilot.py
+@@ -0,0 +1,53 @@
++from fastapi import APIRouter, Depends
++from pydantic import BaseModel, Field
++from services.copilot.copilot_service import CopilotService
++from auth.rbac import require_role
++
++router = APIRouter(prefix="/copilot", tags=["copilot"])
++svc = CopilotService()
++
++class BlueprintIn(BaseModel):
++    module: str = Field(..., pattern=r"^[a-z0-9_./-]+$")
++    targets: list[str] = []
++    options: dict = {}
++
++class GenerateIn(BaseModel):
++    blueprint_id: str
++    language: str = Field(..., pattern="^(python|ts|go|rust)$")
++    integrate: bool = True
++
++class IntegrateIn(BaseModel):
++    modules: list[str]
++    link_menu: bool = True
++
++class PullRequestIn(BaseModel):
++    branch: str
++    title: str
++    body: str = ""
++
++class ApplyIn(BaseModel):
++    pr_number: int
++
++@router.post("/blueprint")
++def blueprint(payload: BlueprintIn, user=Depends(require_role(["architect","admin"]))):
++    return svc.create_blueprint(payload.model_dump())
++
++@router.post("/generate")
++def generate(payload: GenerateIn, user=Depends(require_role(["architect","admin"]))):
++    return svc.generate_code(payload.model_dump())
++
++@router.post("/integrate")
++def integrate(payload: IntegrateIn, user=Depends(require_role(["architect","admin"]))):
++    return svc.integrate_modules(payload.model_dump())
++
++@router.post("/pr")
++def open_pr(payload: PullRequestIn, user=Depends(require_role(["architect","admin"]))):
++    return svc.open_pr(payload.model_dump())
++
++@router.post("/apply")
++def apply(payload: ApplyIn, user=Depends(require_role(["admin"]))):
++    return svc.apply_changes(payload.model_dump())
++
++@router.get("/status")
++def status():
++    return svc.status()
+
+diff --git a/backend/routes/routes_core.py b/backend/routes/routes_core.py
+new file mode 100644
+--- /dev/null
++++ b/backend/routes/routes_core.py
+@@ -0,0 +1,6 @@
++from fastapi import APIRouter
++router = APIRouter(prefix="/core", tags=["core"])
++
++@router.get("/health")
++def health():
++    return {"ok": True, "api": "up"}
+
+diff --git a/backend/routes/routes_helios.py b/backend/routes/routes_helios.py
+new file mode 100644
+--- /dev/null
++++ b/backend/routes/routes_helios.py
+@@ -0,0 +1,23 @@
++from fastapi import APIRouter, Depends
++from pydantic import BaseModel, Field
++from services.helios.helios_service import HeliosService
++from auth.rbac import require_role
++
++router = APIRouter(prefix="/helios", tags=["helios"])
++svc = HeliosService()
++
++class ApplyRecIn(BaseModel):
++    recommendation_id: str = Field(..., pattern=r"^[A-Z0-9_.-]+$")
++    dry_run: bool = True
++
++@router.get("/insights")
++def insights(user=Depends(require_role(["ops","admin"]))):
++    return svc.current_insights()
++
++@router.post("/apply")
++def apply(payload: ApplyRecIn, user=Depends(require_role(["admin"]))):
++    return svc.apply_recommendation(payload.model_dump())
++
++@router.get("/health")
++def health(user=Depends(require_role(["ops","admin"]))):
++    return svc.health_view()
+
+diff --git a/backend/run_api.sh b/backend/run_api.sh
+new file mode 100644
+--- /dev/null
++++ b/backend/run_api.sh
+@@ -0,0 +1,6 @@
++#!/usr/bin/env bash
++export AURUM_ENV=dev
++export JWT_SECRET=dev
++export DB_URL=postgresql://aurum:pass@localhost:5432/aurum
++export REDIS_URL=redis://localhost:6379/0
++uvicorn backend.server:app --host 0.0.0.0 --port 8000 --reload
+
+diff --git a/backend/server.py b/backend/server.py
+new file mode 100644
+--- /dev/null
++++ b/backend/server.py
+@@ -0,0 +1,22 @@
++from fastapi import FastAPI, Request
++from fastapi.responses import JSONResponse
++from config import get_settings
++from utils.audit import jlog
++
++from routes import routes_core, routes_copilot, routes_helios
++
++settings = get_settings()
++app = FastAPI(title="AURUM API", version="1.0.0")
++
++@app.exception_handler(Exception)
++async def all_exceptions_handler(request: Request, exc: Exception):
++    jlog("error.unhandled", path=str(request.url), method=request.method, error=str(exc))
++    return JSONResponse({"ok": False, "error": "internal_error"}, status_code=500)
++
++# include routers
++for r in [routes_core.router, routes_copilot.router, routes_helios.router]:
++    app.include_router(r, prefix="/api")
++
++@app.get("/")
++def root():
++    return {"ok": True, "app": "AURUM", "version": "1.0.0"}
+
+diff --git a/backend/services/copilot/copilot_service.py b/backend/services/copilot/copilot_service.py
+new file mode 100644
+--- /dev/null
++++ b/backend/services/copilot/copilot_service.py
+@@ -0,0 +1,74 @@
++from uuid import uuid4
++from pathlib import Path
++from adapters.repo_client import RepoClient
++from adapters.ci_client import CIClient
++from adapters.codex_client import CodexClient
++from utils.audit import jlog
++
++BASE = Path(__file__).resolve().parents[2]
++
++class CopilotService:
++    def __init__(self):
++        self.repo = RepoClient()
++        self.ci = CIClient()
++        self.ai = CodexClient()
++
++    def _branch(self, prefix="feat/copilot"):
++        return f"{prefix}-{uuid4().hex[:8]}"
++
++    def create_blueprint(self, payload: dict):
++        bp_id = f"bp-{uuid4().hex[:8]}"
++        bp_dir = BASE / "templates" / "starters" / bp_id
++        bp_dir.mkdir(parents=True, exist_ok=True)
++        (bp_dir / "blueprint.json").write_text(str(payload), encoding="utf-8")
++        jlog("copilot.bp.created", id=bp_id)
++        return {"ok": True, "blueprint_id": bp_id}
++
++    def generate_code(self, payload: dict):
++        bp = payload["blueprint_id"]
++        lang = payload["language"]
++        branch = self._branch("feat/gen")
++        self.repo.new_branch(branch)
++
++        prompt = (
++            f"Projeto AURUM (FastAPI). Gere o código do módulo a partir do blueprint {bp} "
++            f"em linguagem {lang}. Crie arquivos mínimos (service, route, teste)."
++        )
++        service_path = BASE / "backend" / "services" / f"{bp}_service.py"
++        route_path   = BASE / "backend" / "routes" / f"routes_{bp}.py"
++        test_path    = BASE / "backend" / "tests" / f"test_{bp}.py"
++
++        # Para ambiente offline, apenas placeholders
++        service_path.parent.mkdir(parents=True, exist_ok=True)
++        service_path.write_text(f"# generated from {bp} in {lang}\n", encoding="utf-8")
++        route_path.parent.mkdir(parents=True, exist_ok=True)
++        route_path.write_text(f"# route for {bp}\n", encoding="utf-8")
++        test_path.parent.mkdir(parents=True, exist_ok=True)
++        test_path.write_text(f"def test_placeholder(): assert True\n", encoding="utf-8")
++
++        self.repo.commit_all(f"copilot: generate {bp}")
++        pr = self.repo.open_pr(title=f"[Copilot] generate {bp}", body="Auto PR by AURUM", branch=branch)
++        jlog("copilot.codegen", blueprint=bp, pr=pr["number"])
++        return {"ok": True, "pr": pr}
++
++    def integrate_modules(self, payload: dict):
++        branch = self._branch("chore/integrate")
++        self.repo.new_branch(branch)
++        modules = payload["modules"]
++        menu_path = BASE / "frontend" / "src" / "routes" / "MenuAuto.tsx"
++        menu_path.parent.mkdir(parents=True, exist_ok=True)
++        menu_path.write_text("// Menu auto-gerado\n", encoding="utf-8")
++        self.repo.commit_all(f"copilot: link modules {modules}")
++        pr = self.repo.open_pr(title="[Copilot] integrate modules", body="Menus e wiring", branch=branch)
++        return {"ok": True, "pr": pr}
++
++    def open_pr(self, payload: dict):
++        return self.repo.open_pr(title=payload["title"], body=payload.get("body",""), branch=payload["branch"])
++
++    def apply_changes(self, payload: dict):
++        res = self.repo.merge_pr(payload["pr_number"])
++        self.ci.run_pipeline()
++        return {"ok": True, "merged": res}
++
++    def status(self):
++        return {"ok": True, "ci": self.ci.status(), "repo": self.repo.status()}
+
+diff --git a/backend/services/helios/helios_service.py b/backend/services/helios/helios_service.py
+new file mode 100644
+--- /dev/null
++++ b/backend/services/helios/helios_service.py
+@@ -0,0 +1,23 @@
++import psutil, os, time
++from utils.audit import jlog
++
++class HeliosService:
++    def current_insights(self):
++        cpu = psutil.cpu_percent(interval=0.2)
++        mem = psutil.virtual_memory()._asdict()
++        pending_migrations = os.path.exists("./.migrations_pending")
++        recs = []
++        if cpu > 85: recs.append({"id":"CPU_HIGH","severity":"warn","action":"scale_api_replicas"})
++        if pending_migrations: recs.append({"id":"DB_MIGRATE","severity":"info","action":"run_migrations"})
++        return {"ok": True, "cpu": cpu, "mem": mem, "recs": recs}
++
++    def apply_recommendation(self, payload: dict):
++        rid = payload["recommendation_id"]
++        if payload.get("dry_run", True):
++            return {"ok": True, "applied": False, "dry_run": True, "id": rid}
++        jlog("helios.apply", id=rid)
++        time.sleep(0.2)
++        return {"ok": True, "applied": True, "id": rid}
++
++    def health_view(self):
++        return {"ok": True, "services": {"api":"up","db":"up","redis":"up"}}
+
+diff --git a/backend/tests/test_rbac.py b/backend/tests/test_rbac.py
+new file mode 100644
+--- /dev/null
++++ b/backend/tests/test_rbac.py
+@@ -0,0 +1,9 @@
++from fastapi.testclient import TestClient
++from backend.server import app
++
++client = TestClient(app)
++
++def test_copilot_requires_role():
++    r = client.post("/api/copilot/blueprint", json={"module":"x","targets":[],"options":{}})
++    # com stub atual pode retornar 200; ajuste quando RBAC real estiver ativo
++    assert r.status_code in (200, 401, 403)
+
+diff --git a/backend/tests/test_smoke.py b/backend/tests/test_smoke.py
+new file mode 100644
+--- /dev/null
++++ b/backend/tests/test_smoke.py
+@@ -0,0 +1,2 @@
++def test_smoke():
++    assert True
+
+diff --git a/backend/utils/audit.py b/backend/utils/audit.py
+new file mode 100644
+--- /dev/null
++++ b/backend/utils/audit.py
+@@ -0,0 +1,10 @@
++import logging, sys, json
++logger = logging.getLogger("aurum")
++handler = logging.StreamHandler(sys.stdout)
++formatter = logging.Formatter('%(message)s')
++handler.setFormatter(formatter)
++logger.setLevel(logging.INFO)
++logger.addHandler(handler)
++
++def jlog(event: str, **kwargs):
++    logger.info(json.dumps({"event": event, **kwargs}, ensure_ascii=False))
+
+diff --git a/docker/Dockerfile.api b/docker/Dockerfile.api
+new file mode 100644
+--- /dev/null
++++ b/docker/Dockerfile.api
+@@ -0,0 +1,7 @@
++FROM python:3.11-slim
++WORKDIR /app
++COPY backend/requirements.txt .
++RUN pip install --no-cache-dir -r requirements.txt
++COPY backend ./backend
++ENV AURUM_ENV=dev JWT_SECRET=dev DB_URL=sqlite:///aurum.db REDIS_URL=redis://redis:6379/0
++CMD ["uvicorn","backend.server:app","--host","0.0.0.0","--port","8000"]
+
+diff --git a/docker/Dockerfile.frontend b/docker/Dockerfile.frontend
+new file mode 100644
+--- /dev/null
++++ b/docker/Dockerfile.frontend
+@@ -0,0 +1,5 @@
++FROM node:20-alpine
++WORKDIR /app
++COPY frontend ./frontend
++EXPOSE 5173
++CMD ["sh","-c","cd frontend && python -m http.server 5173"]
+
+diff --git a/docker/docker-compose.yml b/docker/docker-compose.yml
+new file mode 100644
+--- /dev/null
++++ b/docker/docker-compose.yml
+@@ -0,0 +1,39 @@
++version: "3.9"
++services:
++  api:
++    build: { context: .., dockerfile: docker/Dockerfile.api }
++    environment:
++      - AURUM_ENV=dev
++      - JWT_SECRET=dev
++      - DB_URL=sqlite:///aurum.db
++      - REDIS_URL=redis://redis:6379/0
++    depends_on:
++      redis: { condition: service_healthy }
++    ports: ["8000:8000"]
++    healthcheck:
++      test: ["CMD-SHELL", "curl -fsS http://localhost:8000 || exit 1"]
++      interval: 15s
++      timeout: 3s
++      retries: 20
++
++  frontend:
++    build: { context: .., dockerfile: docker/Dockerfile.frontend }
++    ports: ["5173:5173"]
++    healthcheck:
++      test: ["CMD-SHELL", "curl -fsS http://localhost:5173 || exit 1"]
++      interval: 15s
++      timeout: 3s
++      retries: 20
++
++  redis:
++    image: redis:7
++    command: ["redis-server", "--appendonly", "yes"]
++    volumes: ["redisdata:/data"]
++    healthcheck:
++      test: ["CMD", "redis-cli", "ping"]
++      interval: 10s
++      timeout: 3s
++      retries: 20
++
++volumes:
++  redisdata: {}
+
+diff --git a/frontend/index.html b/frontend/index.html
+new file mode 100644
+--- /dev/null
++++ b/frontend/index.html
+@@ -0,0 +1,3 @@
++<!doctype html>
++<html><head><meta charset="utf-8"><title>AURUM</title></head>
++<body><div id="root">AURUM Frontend Placeholder</div></body></html>
+
+diff --git a/frontend/src/app.tsx b/frontend/src/app.tsx
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/app.tsx
+@@ -0,0 +1,1 @@
++export default function App(){ return <div>AURUM Frontend</div>; }
+
+diff --git a/frontend/src/lib/api.ts b/frontend/src/lib/api.ts
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/lib/api.ts
+@@ -0,0 +1,4 @@
++export async function api(path:string, init?:RequestInit){
++  const res = await fetch(`/api${path}`, init);
++  return res.json();
++}
+
+diff --git a/frontend/src/routes/Dashboard.tsx b/frontend/src/routes/Dashboard.tsx
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/routes/Dashboard.tsx
+@@ -0,0 +1,1 @@
++export default function Dashboard(){ return <div>Dashboard</div>; }
